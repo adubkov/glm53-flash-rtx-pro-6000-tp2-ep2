@@ -1,0 +1,28 @@
+# Boot-time bring-up for the GLM-5.3-Flash stack. Oneshot: compose up -d once at
+# boot; nothing supervises the container afterwards (restart: "no" in compose.yaml
+# is deliberate -- a crash-looping multi-hundred-GB VRAM load is worse than staying
+# down; the unit re-ups at the next boot). Opt in per deployment by touching
+# boot-start.enabled in the deploy directory; absent the marker the unit no-ops
+# and the stack stays down.
+# Install: adjust the two paths below, then
+#   systemctl --enable glm53-boot.service   (as root, after copying to
+#   /etc/systemd/system/glm53-boot.service and `systemctl daemon-reload`)
+
+[Unit]
+Description=GLM-5.3-Flash TP2+EP2 serving stack (docker compose, opt-in)
+Requires=docker.service
+After=docker.service network-online.target
+# Uncomment and set to the filesystem holding MODEL_DIR / CACHE_DIR so this unit
+# cannot race their mount:
+#RequiresMountsFor=/path/holding/model-and-cache
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Adjust to the checkout of this repo's deploy/ directory.
+WorkingDirectory=/opt/glm53-flash-rtx-pro-6000-tp2-ep2/deploy
+ExecCondition=/usr/bin/test -f boot-start.enabled
+ExecStart=/usr/bin/docker compose up -d
+
+[Install]
+WantedBy=multi-user.target

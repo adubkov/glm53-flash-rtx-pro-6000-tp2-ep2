@@ -1,0 +1,177 @@
+--- a/opt/sglang-source/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
++++ b/opt/sglang-source/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+@@ -88,7 +88,28 @@
+ 
+     topk_ids = torch.zeros((prefill_tokens, top_k), dtype=torch.int32, device=device)
+     block_size = select_route_block_size_m(prefill_tokens, top_k, num_experts)
+-    pack_topk_routes_by_expert(topk_ids, block_size, num_experts)
++    # EP: the runtime route-pack path always runs expert_map-aware (the
++    # direct top-k route path requires no map, so every EP call packs
++    # through the map kernels with NUM_EXPERTS == expert_map.numel()).
++    # Warm exactly that specialization; the no-map variant would be dead
++    # weight on EP ranks.
++    from sglang.srt.runtime_context import get_parallel
++
++    ep_size = int(get_parallel().moe_ep_size)
++    if ep_size > 1:
++        if num_experts % ep_size:
++            return False
++        num_local = num_experts // ep_size
++        first_global = int(get_parallel().moe_ep_rank) * num_local
++        expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
++        expert_map[first_global : first_global + num_local] = torch.arange(
++            num_local, dtype=torch.int32, device=device
++        )
++        pack_topk_routes_by_expert(
++            topk_ids, block_size, num_experts, expert_map=expert_map
++        )
++    else:
++        pack_topk_routes_by_expert(topk_ids, block_size, num_experts)
+     return True
+ 
+ 
+@@ -105,12 +126,10 @@
+             "FlashInfer b12x W4A16 currently supports TP without expert "
+             "all-to-all; use TP2/EP1."
+         )
+-    if quant_info.moe_ep_size != 1:
+-        raise NotImplementedError("FlashInfer b12x W4A16 requires EP size 1.")
+-    if runner_config.num_local_experts != runner_config.num_experts:
+-        raise NotImplementedError(
+-            "FlashInfer b12x W4A16 requires every expert to be local."
+-        )
++    # EP: each rank owns a contiguous slice of the global expert ids. The
++    # FlashInfer W4A16 static path remaps global topk ids through the
++    # workspace's expert_map (built with first_global = rank * local count)
++    # and the MoE layer all-reduces the partial outputs.
+     if runner_config.activation != "silu" or not runner_config.is_gated:
+         raise NotImplementedError(
+             "The GLM b12x W4A16 path currently requires gated SiLU."
+@@ -125,7 +144,13 @@
+         with use_symmetric_memory(
+             get_tp_group(), disabled=not is_allocation_symmetric()
+         ):
+-            output = torch.empty_like(x, dtype=torch.bfloat16)
++            if quant_info.moe_ep_size != 1:
++                # EP: tokens routed only to foreign experts get no write from
++                # this rank; zero the buffer so the layer all-reduce sums
++                # clean partials.
++                output = torch.zeros_like(x, dtype=torch.bfloat16)
++            else:
++                output = torch.empty_like(x, dtype=torch.bfloat16)
+ 
+     if quant_info.prepared_weights is None:
+         raise RuntimeError(
+@@ -149,6 +174,7 @@
+         topk_weights=topk_output.topk_weights,
+         num_experts=runner_config.num_experts,
+         num_local_experts=runner_config.num_local_experts,
++        first_global=quant_info.moe_ep_rank * (runner_config.num_local_experts or 0),
+         top_k=runner_config.top_k,
+         scatter_output=output,
+         activation="silu",
+--- a/opt/sglang/lib/python3.12/site-packages/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py
++++ b/opt/sglang/lib/python3.12/site-packages/flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py
+@@ -2610,16 +2610,19 @@
+     state_E: int,
+     weight_E: int,
+     device: torch.device,
++    first_global: int = 0,
+ ) -> torch.Tensor | None:
+     if int(state_E) == int(weight_E):
+         return None
+     if int(state_E) > int(weight_E):
+         raise ValueError("num_local_experts cannot exceed num_experts")
++    if int(first_global) < 0 or int(first_global) + int(state_E) > int(weight_E):
++        raise ValueError("first_global out of range for the local expert slice")
+     expert_map = torch.empty((int(weight_E),), dtype=torch.int32, device=device)
+     expert_map.fill_(-1)
+-    expert_map[: int(state_E)].copy_(
+-        torch.arange(int(state_E), dtype=torch.int32, device=device)
+-    )
++    expert_map[
++        int(first_global) : int(first_global) + int(state_E)
++    ].copy_(torch.arange(int(state_E), dtype=torch.int32, device=device))
+     return expert_map
+ 
+ 
+@@ -2633,6 +2636,7 @@
+     num_topk: int,
+     device: torch.device,
+     activation: str = "silu",
++    first_global: int = 0,
+ ) -> Sm120W4A16MoEWorkspace:
+     is_gated = validate_activation(activation)
+     routed_rows = max(1, int(routed_rows))
+@@ -2704,6 +2708,7 @@
+         expert_map=_make_w4a16_expert_map(
+             state_E=state_E,
+             weight_E=weight_E,
++            first_global=first_global,
+             device=device,
+         ),
+     )
+@@ -2825,6 +2830,7 @@
+     activation: str = "silu",
+     swiglu_limit: float | None = None,
+     source_format: str = "modelopt",
++    first_global: int = 0,
+     _workspace=None,
+     _prepared_weights=None,
+ ) -> torch.Tensor:
+@@ -2862,6 +2868,7 @@
+             device=a.device,
+             quant_mode="w4a16",
+             activation=activation,
++            first_global=first_global,
+         )
+     else:
+         workspace = _workspace
+@@ -2993,6 +3000,7 @@
+     activation_precision: str | None = None,
+     backend: str | None = None,
+     activation: str = "silu",
++    first_global: int = 0,
+ ) -> _Sm120Workspace:
+     """Allocate the right SM120 MoE workspace from a quantization mode."""
+     mode = _normalize_quant_mode(quant_mode, activation_precision)
+@@ -3014,6 +3022,7 @@
+             num_topk=num_topk,
+             device=device,
+             activation=activation,
++            first_global=first_global,
+         )
+ 
+     activation_precision = "fp4"
+@@ -3067,6 +3076,7 @@
+     activation_precision: str = "fp4",
+     quant_mode: str | None = None,
+     activation: str = "silu",
++    first_global: int = 0,
+ ) -> _Sm120Workspace:
+     """Get or allocate a cached workspace for the given problem shape.
+ 
+@@ -3131,6 +3141,7 @@
+             activation_precision=activation_precision,
+             backend=backend,
+             activation=activation,
++            first_global=first_global,
+         )
+ 
+         _retire_workspace(cached)
+@@ -3454,6 +3465,7 @@
+     activation_precision: str = "fp4",
+     quant_mode: str | None = None,
+     source_format: str = "modelopt",
++    first_global: int = 0,
+     _workspace=None,
+     _weight_views=None,
+     _prepared_weights=None,
+@@ -3521,6 +3533,7 @@
+             num_experts=num_experts,
+             top_k=top_k,
+             num_local_experts=num_local_experts,
++            first_global=first_global,
+             scatter_output=scatter_output,
+             fast_math=fast_math,
+             activation=activation,

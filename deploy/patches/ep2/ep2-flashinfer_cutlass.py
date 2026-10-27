@@ -1,0 +1,609 @@
+"""FlashInfer CUTLASS MoE fused funcs.
+
+This module owns the FlashInfer ``cutlass_fused_moe`` calls used by the
+unquantized, ModelOpt FP8, ModelOpt NVFP4, and CUTLASS MXFP4 MoE paths, plus
+the shared ``flashinfer_mxfp4`` dispatcher. Quantization methods prepare a
+small quant_info payload and route through ``MoeRunner``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
+
+import torch
+
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.moe_runner.base import (
+    MoeQuantInfo,
+    MoeRunnerConfig,
+    register_fused_func,
+)
+from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.common import next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
+    )
+
+
+@dataclass
+class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
+    """Payload for FlashInfer CUTLASS fused MoE.
+
+    ``quant_type`` selects the input/weight conventions:
+      - ``"bf16"``: unquantized weights, BF16/FP16 input, no quant scales.
+      - ``"fp8"``: FP8 weights, FP8-quantized input, per-tensor scales.
+      - ``"fp4"``: NVFP4 packed weights and optional NVFP4 packed input.
+      - ``"w4a16_e4m3_k32"``: SM12x E2M1 weights with E4M3 K/32 scales
+        and BF16 activations through FlashInfer's b12x W4A16 kernels.
+    """
+
+    quant_type: str
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    quant_scales: Optional[list[torch.Tensor]] = None
+    output_dtype: Optional[torch.dtype] = None
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    moe_ep_size: int = 1
+    moe_ep_rank: int = 0
+    apply_routed_scaling_factor: bool = True
+    prepared_weights: Optional[Any] = None
+
+
+@torch.inference_mode()
+def precompile_w4a16_prefill_routes(
+    *, device: torch.device, num_experts: int, top_k: int, prefill_tokens: int = 8192
+) -> bool:
+    """Compile the selected large-prefill route pack before cache allocation."""
+    device = torch.device(device)
+    if (
+        device.type != "cuda"
+        or torch.cuda.get_device_capability(device) != (12, 0)
+        or num_experts <= 0
+        or top_k <= 0
+        or prefill_tokens <= 0
+    ):
+        return False
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        select_route_block_size_m,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_route_pack import (
+        pack_topk_routes_by_expert,
+    )
+
+    topk_ids = torch.zeros((prefill_tokens, top_k), dtype=torch.int32, device=device)
+    block_size = select_route_block_size_m(prefill_tokens, top_k, num_experts)
+    # EP: the runtime route-pack path always runs expert_map-aware (the
+    # direct top-k route path requires no map, so every EP call packs
+    # through the map kernels with NUM_EXPERTS == expert_map.numel()).
+    # Warm exactly that specialization; the no-map variant would be dead
+    # weight on EP ranks.
+    from sglang.srt.runtime_context import get_parallel
+
+    ep_size = int(get_parallel().moe_ep_size)
+    if ep_size > 1:
+        if num_experts % ep_size:
+            return False
+        num_local = num_experts // ep_size
+        first_global = int(get_parallel().moe_ep_rank) * num_local
+        expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
+        expert_map[first_global : first_global + num_local] = torch.arange(
+            num_local, dtype=torch.int32, device=device
+        )
+        pack_topk_routes_by_expert(
+            topk_ids, block_size, num_experts, expert_map=expert_map
+        )
+    else:
+        pack_topk_routes_by_expert(topk_ids, block_size, num_experts)
+    return True
+
+
+def _run_flashinfer_b12x_w4a16(
+    *,
+    dispatch_output,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    output: Optional[torch.Tensor],
+    enable_alltoall: bool,
+) -> torch.Tensor:
+    if enable_alltoall:
+        raise NotImplementedError(
+            "FlashInfer b12x W4A16 currently supports TP without expert "
+            "all-to-all; use TP2/EP1."
+        )
+    # EP: each rank owns a contiguous slice of the global expert ids. The
+    # FlashInfer W4A16 static path remaps global topk ids through the
+    # workspace's expert_map (built with first_global = rank * local count)
+    # and the MoE layer all-reduces the partial outputs.
+    if runner_config.activation != "silu" or not runner_config.is_gated:
+        raise NotImplementedError(
+            "The GLM b12x W4A16 path currently requires gated SiLU."
+        )
+    assert quant_info.quant_scales is not None and len(quant_info.quant_scales) == 4
+    if runner_config.num_experts is None or runner_config.top_k is None:
+        raise ValueError("b12x W4A16 requires num_experts and top_k in runner config")
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    if output is None:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            if quant_info.moe_ep_size != 1:
+                # EP: tokens routed only to foreign experts get no write from
+                # this rank; zero the buffer so the layer all-reduce sums
+                # clean partials.
+                output = torch.zeros_like(x, dtype=torch.bfloat16)
+            else:
+                output = torch.empty_like(x, dtype=torch.bfloat16)
+
+    if quant_info.prepared_weights is None:
+        raise RuntimeError(
+            "SM12x E4M3-K32 W4A16 requires load-time in-place prepared weights"
+        )
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+        launch_sm120_moe,
+    )
+
+    w13_scale, w13_global_scale, w2_scale, w2_global_scale = quant_info.quant_scales
+    return launch_sm120_moe(
+        a=x,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=w13_scale,
+        w1_alpha=w13_global_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=w2_scale,
+        w2_alpha=w2_global_scale,
+        topk_ids=topk_output.topk_ids.to(torch.int),
+        topk_weights=topk_output.topk_weights,
+        num_experts=runner_config.num_experts,
+        num_local_experts=runner_config.num_local_experts,
+        first_global=quant_info.moe_ep_rank * (runner_config.num_local_experts or 0),
+        top_k=runner_config.top_k,
+        scatter_output=output,
+        activation="silu",
+        swiglu_limit=(
+            float(runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+            if (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+            else None
+        ),
+        quant_mode="w4a16",
+        source_format="modelopt_e4m3_k32",
+        _prepared_weights=quant_info.prepared_weights,
+    )
+
+
+@dataclass
+class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
+    """Quantization payload for CUTLASS MXFP4 MoE.
+
+    SM90 consumes either W4A16-interleaved weights/scales or the Humming-style
+    W4A8 layouts. SM120 consumes packed MXFP4 weights and block-interleaved
+    scales with MXFP8 activations.
+    """
+
+    # SM90 weights are interleaved; SM120 weights remain checkpoint-packed.
+    w13_weight: torch.Tensor  # [E, 2*N, K/2]
+    w2_weight: torch.Tensor  # [E, K, N/2]
+
+    # E8M0 block scales in the layout selected by the quantization method.
+    w13_weight_scale: torch.Tensor  # [E, 2*N, K/32]
+    w2_weight_scale: torch.Tensor  # [E, K, N/32]
+
+    # A non-None global scale selects the SM120 MXFP8 activation path.
+    mxfp4_weight_global_scale: Optional[torch.Tensor] = None
+
+    # A complete non-None triplet selects the SM90 Humming W4A8 path. The
+    # residuals are FP32 [num_local_experts] and already include the fixed 2^6
+    # compensation required by FlashInfer's epilogue.
+    w13_humming_residual_scale: Optional[torch.Tensor] = None
+    w2_humming_residual_scale: Optional[torch.Tensor] = None
+    humming_fc2_act_scale: Optional[torch.Tensor] = None
+
+    # Per-expert bias. GPT-OSS has both; DSv4 leaves both None.
+    w13_bias: Optional[torch.Tensor] = None  # bf16 [E, 2*N]
+    w2_bias: Optional[torch.Tensor] = None  # bf16 [E, K]
+
+    # Optional per-expert SwiGLU overrides, fp32 [E].
+    swiglu_alpha: Optional[torch.Tensor] = None
+    swiglu_beta: Optional[torch.Tensor] = None
+    swiglu_limit: Optional[torch.Tensor] = None
+
+    # Bailing clamps after SiLU, which the kernel only implements in its
+    # SwigluStep variant.
+    use_swiglu_step: bool = False
+
+    # TP/EP topology (forwarded to the FlashInfer kernel)
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    moe_ep_size: int = 1
+    moe_ep_rank: int = 0
+
+    # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
+    # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
+    padded_hidden: Optional[int] = None
+
+
+def _flashinfer_cutlass_fused_moe():
+    if not is_flashinfer_available():
+        raise RuntimeError(
+            "flashinfer_cutlass MoE runner backend requires flashinfer to be installed."
+        )
+    from flashinfer.fused_moe import cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+
+    return cutlass_fused_moe, ActivationType
+
+
+def _activation_type(runner_config: MoeRunnerConfig):
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
+
+    _, ActivationType = _flashinfer_cutlass_fused_moe()
+    activation = ActivationType(
+        get_activation_type(
+            runner_config.activation,
+            is_gated=runner_config.is_gated,
+        )
+    )
+    supported = {
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.Relu2,
+        ActivationType.Identity,
+    }
+    assert activation in supported, (
+        f"Activation {runner_config.activation!r} "
+        f"(is_gated={runner_config.is_gated}) maps to {activation.name}, "
+        "which is not supported by flashinfer cutlass moe."
+    )
+    return activation
+
+
+def _maybe_apply_routed_scaling_factor(
+    output: torch.Tensor,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> torch.Tensor:
+    if (
+        quant_info.apply_routed_scaling_factor
+        and runner_config.routed_scaling_factor is not None
+    ):
+        output.mul_(runner_config.routed_scaling_factor)
+    return output
+
+
+def _prepare_input(
+    dispatch_output,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.dtype, int]:
+    x = dispatch_output.hidden_states
+    x_sf = dispatch_output.hidden_states_scale
+
+    if quant_info.quant_type == "fp8":
+        assert quant_info.quant_scales is not None and len(quant_info.quant_scales) == 4
+        x, _ = scaled_fp8_quant(x, quant_info.quant_scales[3])
+        x_sf = None
+        output_dtype = quant_info.output_dtype or dispatch_output.hidden_states.dtype
+        output_col = dispatch_output.hidden_states.shape[1]
+    elif quant_info.quant_type == "fp4":
+        output_dtype = quant_info.output_dtype or torch.bfloat16
+        output_col = x.shape[1]
+        if x_sf is not None and runner_config.is_gated:
+            output_col *= 2
+    else:
+        assert quant_info.quant_type == "bf16"
+        output_dtype = quant_info.output_dtype or x.dtype
+        output_col = x.shape[1]
+
+    return x, x_sf, output_dtype, output_col
+
+
+def _run_flashinfer_cutlass(
+    *,
+    dispatch_output,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    output: Optional[torch.Tensor] = None,
+    enable_alltoall: bool = False,
+) -> torch.Tensor:
+    if quant_info.quant_type == "w4a16_e4m3_k32":
+        return _run_flashinfer_b12x_w4a16(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=runner_config,
+            output=output,
+            enable_alltoall=enable_alltoall,
+        )
+
+    flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
+
+    topk_output = dispatch_output.topk_output
+    topk_weights = topk_output.topk_weights
+    topk_ids = topk_output.topk_ids
+    x, x_sf, output_dtype, output_col = _prepare_input(
+        dispatch_output, quant_info, runner_config
+    )
+
+    if output is None:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            output = torch.empty(
+                x.shape[0],
+                output_col,
+                dtype=output_dtype,
+                device=x.device,
+            )
+
+    w13_weight = quant_info.w13_weight
+    w2_weight = quant_info.w2_weight
+    quant_scales = quant_info.quant_scales
+    if quant_info.quant_type == "fp4":
+        w13_weight = w13_weight.view(torch.long)
+        w2_weight = w2_weight.view(torch.long)
+        assert quant_scales is not None and len(quant_scales) == 6
+        quant_scales = [
+            quant_scales[0],
+            quant_scales[1].view(torch.int32),
+            quant_scales[2],
+            quant_scales[3],
+            quant_scales[4].view(torch.int32),
+            quant_scales[5],
+        ]
+
+    output = flashinfer_cutlass_fused_moe(
+        output=output,
+        input=x,
+        token_selected_experts=topk_ids.to(torch.int),
+        token_final_scales=topk_weights,
+        fc1_expert_weights=w13_weight,
+        fc2_expert_weights=w2_weight,
+        output_dtype=output_dtype,
+        input_sf=x_sf,
+        quant_scales=quant_scales,
+        ep_size=quant_info.moe_ep_size,
+        ep_rank=quant_info.moe_ep_rank,
+        tp_size=quant_info.moe_tp_size,
+        tp_rank=quant_info.moe_tp_rank,
+        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        activation_type=_activation_type(runner_config),
+        enable_alltoall=enable_alltoall,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+    )[0]
+
+    if quant_info.quant_type in ("bf16", "fp8"):
+        _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
+    return output
+
+
+@register_fused_func("none", "flashinfer_cutlass")
+def fused_experts_none_to_flashinfer_cutlass(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    )
+
+    output = _run_flashinfer_cutlass(
+        dispatch_output=dispatch_output,
+        quant_info=quant_info,
+        runner_config=runner_config,
+    )
+    return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("flashinfer", "flashinfer_cutlass")
+def fused_experts_flashinfer_to_flashinfer_cutlass(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    )
+
+    output = _run_flashinfer_cutlass(
+        dispatch_output=dispatch_output,
+        quant_info=quant_info,
+        runner_config=runner_config,
+        output=dispatch_output.moe_output,
+        enable_alltoall=True,
+    )
+    return FlashinferCombineInput(hidden_states=output)
+
+
+@register_fused_func("none", "flashinfer_mxfp4")
+def fused_experts_none_to_flashinfer_mxfp4(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """Dispatch flashinfer_mxfp4 by quant-info type.
+
+    Both mxfp4 paths register under this single ``("none", "flashinfer_mxfp4")``
+    key but call different kernels.
+    """
+    if isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+        return _fused_experts_flashinfer_mxfp4_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
+
+    # Keep one fused-op registration for the shared backend while loading the
+    # TRT-LLM implementation only when its quant-info type is dispatched.
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+    )
+
+    if isinstance(quant_info, FlashInferTrtllmGenMxfp4MoeQuantInfo):
+        return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            dispatch_output, quant_info, runner_config
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    )
+
+
+def _fused_experts_flashinfer_mxfp4_cutlass(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferCutlassMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+
+    # Under ``--moe-runner-backend flashinfer_mxfp4`` topk may be in bypassed
+    # form (the SM100 trtllm-gen path does routing internally). The CUTLASS
+    # SM90 path needs explicit topk_ids / topk_weights; materialize here.
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        topk_output = topk_output.to_standard()
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+
+    # GPT-OSS: pad input hidden dim up to the loaded weight width. DSv4
+    # leaves padded_hidden as None (or equal to origin_hidden), no pad.
+    origin_hidden = x.shape[-1]
+    padded_hidden = quant_info.padded_hidden
+    do_pad = padded_hidden is not None and padded_hidden != origin_hidden
+    if do_pad:
+        x = torch.nn.functional.pad(
+            x,
+            (0, padded_hidden - origin_hidden),
+            mode="constant",
+            value=0.0,
+        )
+
+    weight_global_scale = quant_info.mxfp4_weight_global_scale
+    use_mxfp8_act_scaling = weight_global_scale is not None
+    w13_humming_residual_scale = quant_info.w13_humming_residual_scale
+    w2_humming_residual_scale = quant_info.w2_humming_residual_scale
+    humming_fc2_act_scale = quant_info.humming_fc2_act_scale
+    humming_scales = (
+        w13_humming_residual_scale,
+        w2_humming_residual_scale,
+        humming_fc2_act_scale,
+    )
+    use_wfp4afp8_humming = any(scale is not None for scale in humming_scales)
+    if use_wfp4afp8_humming and not all(scale is not None for scale in humming_scales):
+        raise ValueError(
+            "SM90 Humming MXFP4 MoE requires both expert residual scales "
+            "and the FC2 activation scale."
+        )
+    if use_wfp4afp8_humming and use_mxfp8_act_scaling:
+        raise ValueError("SM90 Humming and SM120 MXFP8 scaling are mutually exclusive.")
+    input_sf = None
+    fc1_expert_weights = quant_info.w13_weight
+    fc2_expert_weights = quant_info.w2_weight
+    if weight_global_scale is not None:
+        from flashinfer import mxfp8_quantize
+
+        x, input_sf = mxfp8_quantize(
+            x,
+            is_sf_swizzled_layout=True,
+            alignment=32,
+        )
+        fc1_expert_weights = fc1_expert_weights.view(torch.int64)
+        fc2_expert_weights = fc2_expert_weights.view(torch.int64)
+        quant_scales = [
+            quant_info.w13_weight_scale.view(torch.int32),
+            weight_global_scale,
+            quant_info.w2_weight_scale.view(torch.int32),
+            weight_global_scale,
+        ]
+    elif use_wfp4afp8_humming:
+        assert w13_humming_residual_scale is not None
+        assert w2_humming_residual_scale is not None
+        assert humming_fc2_act_scale is not None
+        quant_scales = [
+            quant_info.w13_weight_scale.view(torch.int32),
+            w13_humming_residual_scale,
+            humming_fc2_act_scale,
+            quant_info.w2_weight_scale.view(torch.int32),
+            w2_humming_residual_scale,
+        ]
+    else:
+        quant_scales = [
+            quant_info.w13_weight_scale.view(torch.int32),
+            quant_info.w2_weight_scale.view(torch.int32),
+        ]
+
+    out_hidden = padded_hidden if do_pad else origin_hidden
+    output_dtype = torch.bfloat16
+    # FlashInfer 0.6.17 intentionally reverted the Humming API. Do not pass the
+    # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
+    # working with SGLang's currently pinned release.
+    humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
+
+    flashinfer_cutlass_fused_moe(
+        input=x,
+        token_selected_experts=topk_ids.to(torch.int32),
+        token_final_scales=topk_weights,
+        fc1_expert_weights=fc1_expert_weights,
+        fc2_expert_weights=fc2_expert_weights,
+        output_dtype=output_dtype,
+        quant_scales=quant_scales,
+        input_sf=input_sf,
+        fc1_expert_biases=quant_info.w13_bias,
+        fc2_expert_biases=quant_info.w2_bias,
+        swiglu_alpha=quant_info.swiglu_alpha,
+        swiglu_beta=quant_info.swiglu_beta,
+        swiglu_limit=quant_info.swiglu_limit,
+        tp_size=quant_info.moe_tp_size,
+        tp_rank=quant_info.moe_tp_rank,
+        ep_size=quant_info.moe_ep_size,
+        ep_rank=quant_info.moe_ep_rank,
+        use_w4_group_scaling=not use_mxfp8_act_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        activation_type=(
+            ActivationType.SwigluStep
+            if quant_info.use_swiglu_step
+            else ActivationType.Swiglu
+        ),
+        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        output=out,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        **humming_kwargs,
+    )
+
+    if do_pad:
+        out = out[:, :origin_hidden].contiguous()
+
+    return StandardCombineInput(hidden_states=out)

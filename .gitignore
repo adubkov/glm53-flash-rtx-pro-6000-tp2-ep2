@@ -1,0 +1,18 @@
+# Operator's real env: names host paths, GPU UUIDs, the API key. The shipped
+# template is .env.example; the real one never enters git.
+.env
+
+# API-key file used by some deployed instances. Scripts in this repo read
+# SGLANG_API_KEY from the environment instead; keep the file out regardless.
+glm53.keys
+
+# Working area for material pulled from serving hosts before it is scrubbed.
+# Never committed.
+.work/
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# Agent/tool scratch from work on this repo.
+.qwen/
